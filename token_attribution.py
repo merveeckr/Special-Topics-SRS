@@ -47,7 +47,7 @@ def load_model(model_name, model_path=None):
 def get_token_saliency(model, tokenizer, text: str):
     """
     Her token için saliency skoru döndürür.
-    Yöntem: backward hook ile embedding gradyanı yakalanır (inputs_embeds kullanılmaz).
+    Yöntem: register_full_backward_hook — retain_grad() gerektirmez.
     Dönüş: tokens (list[str]), saliency (array shape [seq_len, n_labels])
     """
     enc = tokenizer(
@@ -58,40 +58,43 @@ def get_token_saliency(model, tokenizer, text: str):
     attention_mask = enc['attention_mask'].to(DEVICE)
     seq_len        = int(attention_mask[0].sum().item())
 
-    # Embedding çıktısını yakalamak için forward hook
-    captured = {}
-    def fwd_hook(module, inp, out):
-        captured['emb'] = out  # (1, MAX_LEN, hidden)
-        captured['emb'].retain_grad()
+    emb_fwd  = {}   # forward: embedding değerleri
+    emb_grad = {}   # backward: embedding gradyanları
 
-    hook_fwd = model.bert.embeddings.word_embeddings.register_forward_hook(fwd_hook)
+    def fwd_hook(module, inp, out):
+        emb_fwd['val'] = out.detach().clone()          # değerleri kaydet
+
+    def bwd_hook(module, grad_in, grad_out):  # module/grad_in unused by design
+        emb_grad['val'] = grad_out[0].detach().clone() # gradyanları yakala
+
+    h_fwd = model.bert.embeddings.word_embeddings.register_forward_hook(fwd_hook)
+    h_bwd = model.bert.embeddings.word_embeddings.register_full_backward_hook(bwd_hook)
+
+    # Olasılıklar için gradient'siz forward
+    with torch.no_grad():
+        logits_det = model(input_ids, attention_mask)
+    probs = torch.sigmoid(logits_det)[0].cpu().numpy()
 
     saliency = np.zeros((seq_len, len(LABEL_COLS)), dtype=np.float32)
 
-    # Önce probs için bir forward pass yap
-    model.zero_grad()
-    with torch.no_grad():
-        logits_no_grad = model(input_ids, attention_mask)
-    probs = torch.sigmoid(logits_no_grad)[0].cpu().numpy()
-
-    # Her label için ayrı backward
     for label_idx in range(len(LABEL_COLS)):
         model.zero_grad()
-        captured.clear()
+        emb_grad.clear()
 
-        logits = model(input_ids, attention_mask)  # forward (hook tetiklenir)
-        logits[0, label_idx].backward()            # backward
+        with torch.enable_grad():
+            logits = model(input_ids, attention_mask)
+            logits[0, label_idx].backward()
 
-        emb  = captured.get('emb')
-        if emb is not None and emb.grad is not None:
-            # input × gradient saliency, L2 norm over hidden dim
-            score = (emb.grad[0, :seq_len] * emb[0, :seq_len]).norm(dim=-1)
-            score = score.detach().cpu().numpy()
+        emb  = emb_fwd.get('val')
+        grad = emb_grad.get('val')
+        if emb is not None and grad is not None:
+            score = (grad[0, :seq_len] * emb[0, :seq_len]).norm(dim=-1).cpu().numpy()
             if score.max() > 0:
                 score = score / score.max()
             saliency[:, label_idx] = score
 
-    hook_fwd.remove()
+    h_fwd.remove()
+    h_bwd.remove()
 
     tokens = tokenizer.convert_ids_to_tokens(input_ids[0].cpu().tolist())[:seq_len]
     preds  = (probs >= 0.5).astype(int)
