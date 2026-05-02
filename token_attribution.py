@@ -47,6 +47,7 @@ def load_model(model_name, model_path=None):
 def get_token_saliency(model, tokenizer, text: str):
     """
     Her token için saliency skoru döndürür.
+    Yöntem: backward hook ile embedding gradyanı yakalanır (inputs_embeds kullanılmaz).
     Dönüş: tokens (list[str]), saliency (array shape [seq_len, n_labels])
     """
     enc = tokenizer(
@@ -55,58 +56,47 @@ def get_token_saliency(model, tokenizer, text: str):
     )
     input_ids      = enc['input_ids'].to(DEVICE)
     attention_mask = enc['attention_mask'].to(DEVICE)
+    seq_len        = int(attention_mask[0].sum().item())
 
-    # Embedding katmanını bul ve gradient için hook kur
-    embeddings = model.bert.embeddings.word_embeddings(input_ids)  # (1, seq, hidden)
-    embeddings = embeddings.detach().requires_grad_(True)
+    # Embedding çıktısını yakalamak için forward hook
+    captured = {}
+    def fwd_hook(module, inp, out):
+        captured['emb'] = out  # (1, MAX_LEN, hidden)
+        captured['emb'].retain_grad()
 
-    # Manuel forward (embedding'den itibaren)
-    def forward_from_embeddings(embeds):
-        # BERT encoder'ı embedding'den çalıştır
-        ext_mask = model.bert.get_extended_attention_mask(
-            attention_mask, input_ids.shape
-        )
-        hidden = model.bert.embeddings(inputs_embeds=embeds)
-        for layer in model.bert.encoder.layer:
-            hidden = layer(hidden, ext_mask)[0]
-        # Pooler yok — last_hidden_state doğrudan
-        lstm_out, _ = model.lstm(hidden)
-        x = lstm_out.permute(0, 2, 1)
-        conv_outs = []
-        for conv in model.convs:
-            c = conv(x)
-            p = model.global_pool(c)
-            conv_outs.append(p.squeeze(-1))
-        cat = torch.cat(conv_outs, dim=1)
-        return model.classifier(cat)  # (1, n_labels)
+    hook_fwd = model.bert.embeddings.word_embeddings.register_forward_hook(fwd_hook)
 
-    logits = forward_from_embeddings(embeddings)
-    probs  = torch.sigmoid(logits)[0]  # (n_labels,)
-
-    # Her label için gradient al
-    seq_len = int(attention_mask[0].sum().item())
     saliency = np.zeros((seq_len, len(LABEL_COLS)), dtype=np.float32)
 
-    for label_idx in range(len(LABEL_COLS)):
-        if embeddings.grad is not None:
-            embeddings.grad.zero_()
-        logits = forward_from_embeddings(embeddings)
-        logits[0, label_idx].backward(retain_graph=True)
+    # Önce probs için bir forward pass yap
+    model.zero_grad()
+    with torch.no_grad():
+        logits_no_grad = model(input_ids, attention_mask)
+    probs = torch.sigmoid(logits_no_grad)[0].cpu().numpy()
 
-        if embeddings.grad is not None:
-            # L2 norm of gradient × embedding (input × gradient saliency)
-            grad = embeddings.grad[0, :seq_len]       # (seq, hidden)
-            emb  = embeddings[0, :seq_len].detach()
-            score = (grad * emb).norm(dim=-1).cpu().numpy()  # (seq,)
-            # Normalize to [0, 1]
+    # Her label için ayrı backward
+    for label_idx in range(len(LABEL_COLS)):
+        model.zero_grad()
+        captured.clear()
+
+        logits = model(input_ids, attention_mask)  # forward (hook tetiklenir)
+        logits[0, label_idx].backward()            # backward
+
+        emb  = captured.get('emb')
+        if emb is not None and emb.grad is not None:
+            # input × gradient saliency, L2 norm over hidden dim
+            score = (emb.grad[0, :seq_len] * emb[0, :seq_len]).norm(dim=-1)
+            score = score.detach().cpu().numpy()
             if score.max() > 0:
                 score = score / score.max()
             saliency[:, label_idx] = score
 
-    tokens = tokenizer.convert_ids_to_tokens(input_ids[0].cpu().tolist())[:seq_len]
-    preds  = (probs.detach().cpu().numpy() >= 0.5).astype(int)
+    hook_fwd.remove()
 
-    return tokens, saliency, preds, probs.detach().cpu().numpy()
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0].cpu().tolist())[:seq_len]
+    preds  = (probs >= 0.5).astype(int)
+
+    return tokens, saliency, preds, probs
 
 
 # ── HTML görselleştirme ───────────────────────────────────────────────────────
