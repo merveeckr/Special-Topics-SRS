@@ -81,6 +81,7 @@ def get_token_saliency(model, tokenizer, text: str):
         model.zero_grad()
         emb_grad.clear()
 
+        model.train()
         with torch.enable_grad():
             logits = model(input_ids, attention_mask)
             logits[0, label_idx].backward()
