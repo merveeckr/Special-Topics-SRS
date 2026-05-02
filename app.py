@@ -17,7 +17,6 @@ if sys.version_info >= (3, 13):
 try:
     from transformers import AutoTokenizer
     from bil import (
-        BertBiLSTMCNN,
         LABEL_COLS,
         TEXT_COL,
         MODEL_NAME,
@@ -27,6 +26,7 @@ try:
         load_gemma_model,
         generate_ai_suggestion,
     )
+    from bench import BertCNNOnly
 except Exception as import_err:
     st.error(f"Kütüphane import hatası: {import_err}. Lütfen Python sürümünüzü ve paket kurulumlarınızı kontrol edin.")
     st.stop()
@@ -58,7 +58,7 @@ def load_model_and_tokenizer(model_name: str):
         st.error(f"Tokenizör yüklenemedi: {e}")
         raise
     
-    model = BertBiLSTMCNN(bert_model_name=model_name, num_labels=len(LABEL_COLS))
+    model = BertCNNOnly(bert_model_name=model_name, num_labels=len(LABEL_COLS))
     import torch  # local import to avoid top-level import on unsupported envs
     model.to(DEVICE)
     
@@ -75,7 +75,7 @@ def load_model_and_tokenizer(model_name: str):
     return model, tokenizer
 
 
-def batch_predict(model: BertBiLSTMCNN, tokenizer, texts: List[str], max_len: int, threshold: float) -> np.ndarray:
+def batch_predict(model: BertCNNOnly, tokenizer, texts: List[str], max_len: int, threshold: float) -> np.ndarray:
     """Optimized batch prediction with progress tracking"""
     predictions = []
     batch_size = 8  # Reduced batch size for better memory management
@@ -643,7 +643,18 @@ def _is_output_compliant(text: str, missing: List[str]) -> bool:
         if any(v in t for v in vague):
             return False
     return True
-st.title("Gereksinim Analizi: BERTürk + Gemma Öneri")
+def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash") -> str:
+    """Gemini API ile tek seferlik metin üretimi."""
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        response = genai.GenerativeModel(model).generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"[Gemini hatası: {e}]"
+
+
+st.title("Gereksinim Analizi: BERTürk + Gemini Öneri")
 
 with st.sidebar:
     st.markdown("**Model Ayarları**")
@@ -659,70 +670,54 @@ with st.sidebar:
         model_name = MODEL_NAME
         st.info("HuggingFace modeli kullanılacak.")
     
+    st.caption("Sınıflandırıcı: BERTürk + CNN  |  F1=0.9907  Acc=0.8950")
     threshold = st.slider("Eşik (sigmoid)", min_value=0.05, max_value=0.95, value=float(THRESH), step=0.05)
     st.divider()
     st.markdown("**LLM Ayarları**")
-    llm_backend = st.selectbox("LLM Backend", options=["HF", "GGUF"], index=0)
-    llm_offline = st.checkbox("HF offline", value=True)
-    
-    # Check for local models
-    local_gemma_path = "./gemma"
-    local_gemma_small_path = "./gemma-small"
-    local_dialog_path = "./dialog"
-    local_llama_path = "./llama"
-    local_phi_path = "./phi"
-    local_roberta_path = "./roberta"
-    
-    model_options = []
-    
-    # Add online small models first (most reliable)
-    model_options.extend(["microsoft/DialoGPT-small", "distilgpt2"])
-    
-    # Add Gemma Small (with special handling)
-    if os.path.exists(local_gemma_small_path):
-        st.success(f"✅ Yerel Gemma Small modeli bulundu: {local_gemma_small_path}")
-        st.info("⚡ Bu model orta boyutta ve hızlı!")
-        st.warning("⚠️ Gemma tokenizer sorunu için özel çözüm uygulanacak.")
-        model_options.append(local_gemma_small_path)
-    
-    # Skip dialog model for now (it has issues)
-    # if os.path.exists(local_dialog_path):
-    #     st.warning(f"⚠️ Yerel Dialog modeli bulundu: {local_dialog_path}")
-    #     st.warning("⚠️ Bu model sorunlu olabilir, test edin.")
-    #     model_options.append(local_dialog_path)
-    
-    # Add Gemma last (slowest)
-    if os.path.exists(local_gemma_path):
-        st.warning(f"⚠️ Yerel Gemma modeli bulundu: {local_gemma_path}")
-        st.warning("⚠️ Gemma çok büyük! 10-15 dakika sürebilir.")
-        model_options.append(local_gemma_path)
+    llm_backend = st.selectbox("LLM Backend", options=["Gemini", "HF", "GGUF"], index=0)
 
-    # Add LLaMA family (HF format)
-    if os.path.exists(local_llama_path):
-        st.info(f"🔹 Yerel LLaMA modeli bulundu: {local_llama_path}")
-        model_options.append(local_llama_path)
+    gemini_api_key = ""
+    gemini_model = "gemini-2.0-flash"
+    active_llm = None
+    use_cpu_only = True
+    max_memory_gb = 4
+    llm_offline = False
 
-    # Add Phi family (HF format)
-    if os.path.exists(local_phi_path):
-        st.info(f"🔹 Yerel Phi modeli bulundu: {local_phi_path}")
-        model_options.append(local_phi_path)
+    if llm_backend == "Gemini":
+        gemini_api_key = st.text_input("Gemini API Key", type="password",
+                                        placeholder="AIza...")
+        gemini_model = st.selectbox("Gemini Model",
+                                     ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+                                     index=0)
+        active_llm = gemini_model
+        if not gemini_api_key:
+            st.warning("API key girilmeden öneri üretilemez.")
+    else:
+        llm_offline = st.checkbox("HF offline", value=True)
 
-    # Add RoBERTa (not supported for generation)
-    if os.path.exists(local_roberta_path):
-        st.warning(f"⚠️ Yerel RoBERTa modeli bulundu: {local_roberta_path}")
-        st.caption("RoBERTa üretim (text-generation) için uygun değildir; seçimde uyarı verilecektir.")
-        model_options.append(local_roberta_path)
-    
-    default_llm_models = ";".join(model_options)
-    
-    llm_models_input = st.text_input("LLM modelleri (; ile)", value=default_llm_models)
-    llm_models = [m.strip() for m in llm_models_input.split(";") if m.strip()]
-    active_llm = st.selectbox("Kullanılacak LLM", llm_models) if llm_models else None
-    
-    # Bellek optimizasyonu seçenekleri
-    st.markdown("**Bellek Optimizasyonu**")
-    use_cpu_only = st.checkbox("Sadece CPU kullan (GPU bellek tasarrufu)", value=True)
-    max_memory_gb = st.slider("Maksimum GPU belleği (GB)", min_value=1, max_value=16, value=4)
+        local_gemma_path = "./gemma"
+        local_gemma_small_path = "./gemma-small"
+        local_llama_path = "./llama"
+        local_phi_path = "./phi"
+
+        model_options = ["microsoft/DialoGPT-small", "distilgpt2"]
+
+        if os.path.exists(local_gemma_small_path):
+            model_options.append(local_gemma_small_path)
+        if os.path.exists(local_gemma_path):
+            model_options.append(local_gemma_path)
+        if os.path.exists(local_llama_path):
+            model_options.append(local_llama_path)
+        if os.path.exists(local_phi_path):
+            model_options.append(local_phi_path)
+
+        llm_models_input = st.text_input("LLM modelleri (; ile)", value=";".join(model_options))
+        llm_models = [m.strip() for m in llm_models_input.split(";") if m.strip()]
+        active_llm = st.selectbox("Kullanılacak LLM", llm_models) if llm_models else None
+
+        st.markdown("**Bellek Optimizasyonu**")
+        use_cpu_only = st.checkbox("Sadece CPU kullan (GPU bellek tasarrufu)", value=True)
+        max_memory_gb = st.slider("Maksimum GPU belleği (GB)", min_value=1, max_value=16, value=4)
     st.markdown("**LLM Üretim Ayarları**")
     gen_temperature = st.slider("Sıcaklık (temperature)", min_value=0.1, max_value=1.0, value=0.3 if (active_llm and "gemma" in active_llm.lower()) else 0.1, step=0.05)
     gen_top_p = st.slider("Top-p", min_value=0.5, max_value=1.0, value=0.8 if (active_llm and "gemma" in active_llm.lower()) else 0.9, step=0.05)
@@ -905,39 +900,32 @@ if uploaded is not None:
                         prompt = build_llm_prompt(req_text, miss)
                     if active_llm is None:
                         st.error("LLM modeli seçin.")
+                    elif llm_backend == "Gemini":
+                        if not gemini_api_key:
+                            st.error("Gemini API key girilmedi.")
+                        else:
+                            with st.spinner("Gemini önerisi oluşturuluyor..."):
+                                t0 = time.perf_counter()
+                                text = call_gemini(prompt, gemini_api_key, gemini_model)
+                                dt = time.perf_counter() - t0
+                                final_text = enforce_improvement(req_text, text, miss, similarity_threshold=float(sim_threshold))
+                                if show_prompt:
+                                    with st.expander("Gönderilen prompt"):
+                                        st.code(prompt)
+                                st.text_area("AI Önerisi", value=final_text, height=200)
+                                st.caption("Kaynak: Gemini API")
+                                with st.expander("Ham Gemini çıktısı"):
+                                    st.write(text)
+                                st.info(f"Süre: {dt:.2f} sn")
                     else:
-                        # Use optimized cached model loading
                         llm_model = load_llm_model(active_llm, llm_backend, llm_offline, use_cpu_only, max_memory_gb)
                         if llm_model is None:
                             st.error("LLM modeli yüklenemedi.")
                         else:
                             with st.spinner("LLM önerisi oluşturuluyor..."):
                                 t0 = time.perf_counter()
-                                
+
                                 if llm_backend == "HF":
-                                    # Optimize parameters based on model type
-                                    if "gemma" in active_llm.lower():
-                                        # Gemma models work better with different parameters
-                                        out = llm_model(
-                                            prompt, 
-                                            max_new_tokens=48,  # Slightly more for Gemma
-                                            do_sample=True, 
-                                            num_beams=1,
-                                            temperature=float(gen_temperature),
-                                            top_p=float(gen_top_p),
-                                            pad_token_id=llm_model.tokenizer.eos_token_id
-                                        )
-                                    else:
-                                        # Standard parameters for other models
-                                        out = llm_model(
-                                            prompt, 
-                                            max_new_tokens=32,  # Very small for memory efficiency
-                                            do_sample=gen_temperature > 0.15,
-                                            num_beams=1,  # Single beam for memory
-                                            temperature=float(gen_temperature),
-                                            pad_token_id=llm_model.tokenizer.eos_token_id
-                                        )
-                                    # Multi-candidate sampling for diversity
                                     gens = []
                                     for _ in range(int(max(1, k_candidates))):
                                         o = llm_model(
@@ -954,7 +942,6 @@ if uploaded is not None:
                                         )
                                         gens.append(o[0].get('generated_text','').strip())
                                     text = select_best_candidate(gens, req_text, miss)
-                                    # Strict retry if too similar to input
                                     if strict_retry:
                                         r_base = _normalize_text(req_text)
                                         r_out = _normalize_text(text)
@@ -964,7 +951,7 @@ if uploaded is not None:
                                                 + "\n\nNot: Yukarıdaki cümleyi tekrar etme; yeni, daha NET, ÖLÇÜLEBİLİR ve DOĞRULANABİLİR tek cümle üret."
                                             )
                                             out2 = llm_model(
-                                                retry_prompt, 
+                                                retry_prompt,
                                                 max_new_tokens=48,
                                                 do_sample=True,
                                                 num_beams=1,
@@ -977,9 +964,9 @@ if uploaded is not None:
                                     gens = []
                                     for _ in range(int(max(1, k_candidates))):
                                         o = llm_model.create_completion(
-                                            prompt=prompt, 
+                                            prompt=prompt,
                                             max_tokens=64,
-                                            temperature=float(gen_temperature), 
+                                            temperature=float(gen_temperature),
                                             top_p=float(gen_top_p),
                                             repeat_penalty=1.1
                                         )
@@ -1001,40 +988,12 @@ if uploaded is not None:
                                                 repeat_penalty=1.1
                                             )
                                             text = out2["choices"][0]["text"].strip()
-                                
-                                dt = time.perf_counter() - t0
-                                # Cleaning helper for forced LLM output
-                                def _clean_llm_text(raw: str) -> str:
-                                    return _sanitize_llm_text(raw)
 
-                                # Compare with rule-based to detect normalization/fallback
+                                dt = time.perf_counter() - t0
                                 rb_text = rule_based_improvement(req_text, miss)
                                 if force_llm_output:
-                                    # Hard validation loop (up to 3 tries)
-                                    attempt = 0
-                                    best_text = text
-                                    while hard_constraints and attempt < 3:
-                                        cleaned = _sanitize_llm_text(best_text)
-                                        if validate_requirement_output(cleaned):
-                                            break
-                                        attempt += 1
-                                        strict = build_strict_prompt(req_text, miss)
-                                        o = llm_model(
-                                            strict,
-                                            max_new_tokens=64,
-                                            min_new_tokens=24,
-                                            do_sample=True,
-                                            num_beams=1,
-                                            temperature=float(gen_temperature),
-                                            top_p=float(gen_top_p),
-                                            no_repeat_ngram_size=2,
-                                            repetition_penalty=1.15,
-                                            pad_token_id=llm_model.tokenizer.eos_token_id
-                                        )
-                                        best_text = o[0].get('generated_text','').strip()
-                                    cleaned = _sanitize_llm_text(best_text)
+                                    cleaned = _sanitize_llm_text(text)
                                     if not validate_requirement_output(cleaned):
-                                        # fallback to best candidate selection
                                         cleaned = _sanitize_llm_text(select_best_candidate(gens, req_text, miss))
                                     final_text = f"İyileştirilmiş gereksinim: {cleaned}."
                                 else:
@@ -1044,7 +1003,7 @@ if uploaded is not None:
                                         st.code(prompt)
                                 st.text_area("AI Önerisi", value=final_text, height=200)
                                 if not force_llm_output and final_text.strip() == rb_text.strip():
-                                    st.caption("Kaynak: LLM çıktısi normalleştirildi veya kural tabanlı metne yakın olduğu için kural tabanlı metin kullanıldı.")
+                                    st.caption("Kaynak: kural tabanlı (LLM çıktısı normalleştirildi)")
                                 else:
                                     st.caption("Kaynak: LLM (üretilen metin korundu)")
                                 with st.expander("Ham LLM çıktısı"):
@@ -1093,38 +1052,32 @@ if uploaded is not None:
                         prompt = build_llm_prompt(single_req, miss)
                     if active_llm is None:
                         st.error("LLM modeli seçin.")
+                    elif llm_backend == "Gemini":
+                        if not gemini_api_key:
+                            st.error("Gemini API key girilmedi.")
+                        else:
+                            with st.spinner("Gemini önerisi oluşturuluyor..."):
+                                t0 = time.perf_counter()
+                                text = call_gemini(prompt, gemini_api_key, gemini_model)
+                                dt = time.perf_counter() - t0
+                                final_text = enforce_improvement(single_req, text, miss, similarity_threshold=float(sim_threshold))
+                                if show_prompt:
+                                    with st.expander("Gönderilen prompt"):
+                                        st.code(prompt)
+                                st.text_area("İyileştirilmiş Gereksinim", value=final_text, height=180)
+                                st.caption("Kaynak: Gemini API")
+                                with st.expander("Ham Gemini çıktısı"):
+                                    st.write(text)
+                                st.info(f"Süre: {dt:.2f} sn")
                     else:
-                        # Use optimized cached model loading
                         llm_model = load_llm_model(active_llm, llm_backend, llm_offline, use_cpu_only, max_memory_gb)
                         if llm_model is None:
                             st.error("LLM modeli yüklenemedi.")
                         else:
                             with st.spinner("LLM önerisi oluşturuluyor..."):
                                 t0 = time.perf_counter()
-                                
+
                                 if llm_backend == "HF":
-                                    # Optimize parameters based on model type
-                                    if "gemma" in active_llm.lower():
-                                        # Gemma models work better with different parameters
-                                        out = llm_model(
-                                            prompt, 
-                                            max_new_tokens=48,  # Slightly more for Gemma
-                                            do_sample=True, 
-                                            num_beams=1,
-                                            temperature=float(gen_temperature),
-                                            top_p=float(gen_top_p),
-                                            pad_token_id=llm_model.tokenizer.eos_token_id
-                                        )
-                                    else:
-                                        # Standard parameters for other models
-                                        out = llm_model(
-                                            prompt, 
-                                            max_new_tokens=32,  # Very small for memory efficiency
-                                            do_sample=gen_temperature > 0.15, 
-                                            num_beams=1,  # Single beam for memory
-                                            temperature=float(gen_temperature),
-                                            pad_token_id=llm_model.tokenizer.eos_token_id
-                                        )
                                     gens = []
                                     for _ in range(int(max(1, k_candidates))):
                                         o = llm_model(
@@ -1150,7 +1103,7 @@ if uploaded is not None:
                                                 + "\n\nNot: Yukarıdaki cümleyi tekrar etme; yeni, daha NET, ÖLÇÜLEBİLİR ve DOĞRULANABİLİR tek cümle üret."
                                             )
                                             out2 = llm_model(
-                                                retry_prompt, 
+                                                retry_prompt,
                                                 max_new_tokens=48,
                                                 do_sample=True,
                                                 num_beams=1,
@@ -1163,9 +1116,9 @@ if uploaded is not None:
                                     gens = []
                                     for _ in range(int(max(1, k_candidates))):
                                         o = llm_model.create_completion(
-                                            prompt=prompt, 
+                                            prompt=prompt,
                                             max_tokens=64,
-                                            temperature=float(gen_temperature), 
+                                            temperature=float(gen_temperature),
                                             top_p=float(gen_top_p),
                                             repeat_penalty=1.1
                                         )
@@ -1187,32 +1140,11 @@ if uploaded is not None:
                                                 repeat_penalty=1.1
                                             )
                                             text = out2["choices"][0]["text"].strip()
-                                
+
                                 dt = time.perf_counter() - t0
                                 rb_text = rule_based_improvement(single_req, miss)
                                 if force_llm_output:
-                                    attempt = 0
-                                    best_text = text
-                                    while hard_constraints and attempt < 3:
-                                        cleaned = _sanitize_llm_text(best_text)
-                                        if validate_requirement_output(cleaned):
-                                            break
-                                        attempt += 1
-                                        strict = build_strict_prompt(single_req, miss)
-                                        o = llm_model(
-                                            strict,
-                                            max_new_tokens=64,
-                                            min_new_tokens=24,
-                                            do_sample=True,
-                                            num_beams=1,
-                                            temperature=float(gen_temperature),
-                                            top_p=float(gen_top_p),
-                                            no_repeat_ngram_size=2,
-                                            repetition_penalty=1.15,
-                                            pad_token_id=llm_model.tokenizer.eos_token_id
-                                        )
-                                        best_text = o[0].get('generated_text','').strip()
-                                    cleaned = _sanitize_llm_text(best_text)
+                                    cleaned = _sanitize_llm_text(text)
                                     if not validate_requirement_output(cleaned):
                                         cleaned = _sanitize_llm_text(select_best_candidate(gens, single_req, miss))
                                     final_text = f"İyileştirilmiş gereksinim: {cleaned}."
@@ -1223,7 +1155,7 @@ if uploaded is not None:
                                         st.code(prompt)
                                 st.text_area("İyileştirilmiş Gereksinim", value=final_text, height=180)
                                 if not force_llm_output and final_text.strip() == rb_text.strip():
-                                    st.caption("Kaynak: LLM çıktısi normalleştirildi veya kural tabanlı metne yakın olduğu için kural tabanlı metin kullanıldı.")
+                                    st.caption("Kaynak: kural tabanlı (LLM çıktısı normalleştirildi)")
                                 else:
                                     st.caption("Kaynak: LLM (üretilen metin korundu)")
                                 with st.expander("Ham LLM çıktısı"):
