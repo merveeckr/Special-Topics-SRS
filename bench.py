@@ -19,6 +19,8 @@ from transformers import AutoTokenizer
 
 from sentence_transformers import SentenceTransformer
 
+from transformers import AutoModel
+
 from bil import (
     BertBiLSTMCNN,
     LABEL_COLS,
@@ -27,6 +29,77 @@ from bil import (
     DEVICE,
     THRESH,
 )
+
+
+# ── Ablasyon mimarileri ────────────────────────────────────────────────────────
+
+class BertMLP(nn.Module):
+    """Sadece BERT [CLS] çıktısı → MLP."""
+    def __init__(self, bert_model_name, dropout=0.3, num_labels=9):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(bert_model_name)
+        hidden = self.bert.config.hidden_size
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_labels),
+        )
+
+    def forward(self, input_ids, attention_mask):
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        cls = out.last_hidden_state[:, 0, :]
+        return self.classifier(cls)
+
+
+class BertBiLSTMOnly(nn.Module):
+    """BERT → BiLSTM → mean-pool → MLP (CNN yok)."""
+    def __init__(self, bert_model_name, lstm_hidden=256, dropout=0.3, num_labels=9):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(bert_model_name)
+        hidden = self.bert.config.hidden_size
+        self.lstm = nn.LSTM(
+            input_size=hidden, hidden_size=lstm_hidden,
+            num_layers=1, batch_first=True, bidirectional=True,
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * lstm_hidden, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_labels),
+        )
+
+    def forward(self, input_ids, attention_mask):
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        lstm_out, _ = self.lstm(out.last_hidden_state)
+        # attention_mask ile geçerli token'ların ortalaması
+        mask = attention_mask.unsqueeze(-1).float()
+        pooled = (lstm_out * mask).sum(1) / mask.sum(1).clamp(min=1)
+        return self.classifier(pooled)
+
+
+class BertCNNOnly(nn.Module):
+    """BERT → Multi-channel CNN → max-pool → concat → MLP (BiLSTM yok)."""
+    def __init__(self, bert_model_name, cnn_out=128, kernel_sizes=(2, 3, 4), dropout=0.3, num_labels=9):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(bert_model_name)
+        hidden = self.bert.config.hidden_size
+        self.convs = nn.ModuleList([
+            nn.Conv1d(hidden, cnn_out, k) for k in kernel_sizes
+        ])
+        self.pool = nn.AdaptiveMaxPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Linear(cnn_out * len(kernel_sizes), 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_labels),
+        )
+
+    def forward(self, input_ids, attention_mask):
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        x = out.last_hidden_state.permute(0, 2, 1)  # (B, H, L)
+        cat = torch.cat([self.pool(conv(x)).squeeze(-1) for conv in self.convs], dim=1)
+        return self.classifier(cat)
 # Offline/SSL settings (corporate environments)
 OFFLINE = os.environ.get("HF_OFFLINE", "0") == "1"
 try:
@@ -254,6 +327,90 @@ def run_dropout_ablation(csv_path: str, model_name: str, dropout_rates: List[flo
     return results
 
 
+def _train_eval_model(model, train_loader, val_loader, epochs, label, lr=1e-5):
+    """Genel eğit-değerlendir yardımcı fonksiyon."""
+    from tqdm import tqdm
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    t0 = time.perf_counter()
+    model.train()
+    for ep in range(epochs):
+        loop = tqdm(train_loader, desc=f"  {label} epoch {ep+1}/{epochs}", leave=True)
+        for batch in loop:
+            input_ids = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            labels = batch['labels'].to(DEVICE)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(input_ids, attention_mask)
+            loss = loss_fn(logits, labels)
+            if torch.isfinite(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                loop.set_postfix(loss=f"{loss.item():.4f}")
+    train_seconds = time.perf_counter() - t0
+
+    model.eval()
+    all_preds, all_labels_list = [], []
+    n_samples = 0
+    with torch.no_grad():
+        t1 = time.perf_counter()
+        for batch in val_loader:
+            logits = model(batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE))
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_preds.append((probs >= THRESH).astype(int))
+            all_labels_list.append(batch['labels'].cpu().numpy())
+            n_samples += batch['input_ids'].size(0)
+        t2 = time.perf_counter()
+
+    y_pred = np.vstack(all_preds)
+    y_true = np.vstack(all_labels_list)
+    return BenchmarkResult(
+        name=label,
+        train_seconds=train_seconds,
+        infer_seconds_per_sample=(t2 - t1) / max(1, n_samples),
+        val_f1_macro=f1_score(y_true, y_pred, average='macro', zero_division=0),
+        val_hamming=hamming_loss(y_true, y_pred),
+        val_accuracy=accuracy_score(y_true, y_pred),
+    )
+
+
+def run_arch_ablation(csv_path: str, model_name: str, epochs: int = 5, batch_size: int = 8) -> List[BenchmarkResult]:
+    """
+    Mimari ablasyon: 4 varyantı aynı koşullarda eğitir ve karşılaştırır.
+      1. BERTürk + MLP          (ne LSTM ne CNN)
+      2. BERTürk + BiLSTM       (sadece LSTM, CNN yok)
+      3. BERTürk + CNN           (sadece CNN, LSTM yok)
+      4. BERTürk + BiLSTM + CNN  (tam model)
+    """
+    X_train, X_val, y_train, y_val = load_dataset(csv_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=OFFLINE)
+    train_ds = SimpleTextDataset(X_train, y_train, tokenizer, MAX_LEN)
+    val_ds   = SimpleTextDataset(X_val,   y_val,   tokenizer, MAX_LEN)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+
+    variants = [
+        ("BERTürk + MLP",          BertMLP(model_name,          num_labels=len(LABEL_COLS))),
+        ("BERTürk + BiLSTM",       BertBiLSTMOnly(model_name,   num_labels=len(LABEL_COLS))),
+        ("BERTürk + CNN",          BertCNNOnly(model_name,       num_labels=len(LABEL_COLS))),
+        ("BERTürk + BiLSTM + CNN", BertBiLSTMCNN(model_name,    num_labels=len(LABEL_COLS))),
+    ]
+
+    results = []
+    for label, model in variants:
+        print(f"\n  [{label}] eğitiliyor ({epochs} epoch)...")
+        model = model.to(DEVICE)
+        try:
+            res = _train_eval_model(model, train_loader, val_loader, epochs, label)
+            results.append(res)
+            print(f"  → F1={res.val_f1_macro:.4f}  Hamming={res.val_hamming:.4f}  Acc={res.val_accuracy:.4f}")
+        except Exception as e:
+            print(f"  HATA [{label}]: {e}")
+    return results
+
+
 def run_st_embedding_logreg(csv_path: str, st_model_name: str, threshold: float = 0.5) -> BenchmarkResult:
     X_train, X_val, y_train, y_val = load_dataset(csv_path)
     # If OFFLINE, st_model_name must be a local directory
@@ -354,7 +511,18 @@ def main():
     except Exception as e:
         print("Dropout ablation failed:", e)
 
-    if results:
+    arch_results: List[BenchmarkResult] = []
+    if os.environ.get("ARCH_ABLATION", "1") != "0":
+        print("\nRunning Architecture Ablation (MLP / BiLSTM / CNN / BiLSTM+CNN) ...")
+        try:
+            arch_results = run_arch_ablation(
+                csv_path, bert_model,
+                epochs=int(os.environ.get("EPOCHS", "5")),
+            )
+        except Exception as e:
+            print("Architecture ablation failed:", e)
+
+    if results or arch_results:
         print("\n=== Benchmark Results ===")
         print(f"{'Model':<45} {'Train(s)':>9} {'Infer(ms)':>10} {'F1-macro':>9} {'Hamming':>8} {'Acc':>7}")
         print("-" * 95)
@@ -369,6 +537,15 @@ def main():
             for r in ablation:
                 d = r.name.split("dropout=")[1].rstrip(")")
                 print(f"{d:>10} {r.val_f1_macro:>10.4f} {r.val_hamming:>10.4f} {r.val_accuracy:>8.4f}")
+
+    if arch_results:
+        print("\n=== Architecture Ablation Summary ===")
+        print(f"{'Mimari':<30} {'F1-macro':>10} {'Hamming':>10} {'Acc':>8}")
+        print("-" * 62)
+        best_f1 = max(r.val_f1_macro for r in arch_results)
+        for r in arch_results:
+            marker = " ◄ EN İYİ" if r.val_f1_macro == best_f1 else ""
+            print(f"{r.name:<30} {r.val_f1_macro:>10.4f} {r.val_hamming:>10.4f} {r.val_accuracy:>8.4f}{marker}")
     else:
         print("No results produced.")
 
