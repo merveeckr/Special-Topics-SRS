@@ -326,8 +326,8 @@ def generate_ai_suggestion(generator, requirement, missing_features):
 def main():
     # CSV load
     df = pd.read_csv(CSV_PATH)
-    texts = df[TEXT_COL].fillna("").tolist()
-    labels = df[LABEL_COLS].values 
+    texts = df[TEXT_COL].fillna("").astype(str).tolist()
+    labels = df[LABEL_COLS].apply(pd.to_numeric, errors='coerce').fillna(0.0).clip(0.0, 1.0).values
 
     # Train/val split
     X_train, X_val, y_train, y_val = train_test_split(texts, labels, test_size=0.15, random_state=RANDOM_SEED, shuffle=True)
